@@ -1,734 +1,411 @@
-import io
-import os
-import json
-import hashlib
-import hmac
-import time
-import tempfile
-import mimetypes
-import sqlite3
-import re
-import secrets
-import smtplib
-import requests
+import os, io, json, time, hmac, hashlib, secrets, sqlite3, smtplib, mimetypes, uuid
 from email.message import EmailMessage
+from datetime import datetime, timedelta
 from pathlib import Path
-from datetime import datetime
-from PIL import Image
 
+from dotenv import load_dotenv
+load_dotenv()
+import streamlit as st
+
+
+def config_value(name, default=""):
+    """Read deployment secrets first (Streamlit Cloud), then local .env."""
+    try:
+        value = st.secrets.get(name, None)
+        if value is not None and str(value).strip() != "":
+            return str(value)
+    except Exception:
+        pass
+    value = os.getenv(name, default)
+    return default if value is None else value
 import numpy as np
 import pandas as pd
 import librosa
 import librosa.display
-import streamlit as st
 import matplotlib.pyplot as plt
 import torch
 from transformers import AutoFeatureExtractor, AutoModelForAudioClassification
 
-TITLE = "VoiceGuard AI · v3.0"
-APP_VERSION = "3.1.0"
+APP_NAME = "VoiceGuard AI"
+DB_PATH = config_value("VOICEGUARD_DB", "voiceguard.db")
 DETECTOR_ID = "garystafford/wav2vec2-deepfake-voice-detector"
-ASR_ID = "openai/whisper-tiny"
 TARGET_SR = 16000
+MAX_UPLOAD_MB = int(config_value("MAX_UPLOAD_MB", "25"))
+MAX_DURATION_SEC = int(config_value("MAX_DURATION_SEC", "300"))
+st.set_page_config(page_title=APP_NAME, page_icon="🛡️", layout="wide")
 
-st.set_page_config(page_title=TITLE, page_icon="🛡️", layout="wide", initial_sidebar_state="expanded")
-
-# ---------- Visual design ----------
 st.markdown("""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Space+Grotesk:wght@500;600;700&display=swap');
-:root { --ink:#eaf2ff; --muted:#9fb0c9; --panel:#111d31; --line:rgba(148,163,184,.18); --cyan:#42d9e8; }
-html, body, [class*="css"] { font-family:'DM Sans',sans-serif; }
-.stApp { background: radial-gradient(ellipse at 15% 0%, #153252 0%, #0a1323 42%, #080f1b 100%); color:var(--ink); }
-.block-container { max-width: 1400px; padding-top: 2rem; padding-bottom: 3rem; }
-h1,h2,h3 { font-family:'Space Grotesk',sans-serif !important; color:#f4f8ff !important; }
-.hero { padding:28px 30px; border:1px solid rgba(66,217,232,.28); border-radius:22px; background:linear-gradient(115deg,rgba(20,54,82,.94),rgba(16,29,49,.92)); box-shadow:0 18px 55px rgba(0,0,0,.22); margin-bottom:22px; }
-.hero-kicker { color:var(--cyan); font-size:.78rem; font-weight:700; letter-spacing:2px; text-transform:uppercase; }
-.hero-title { font:700 2.25rem 'Space Grotesk',sans-serif; margin:8px 0 5px; color:#fff; }
-.hero-sub { color:#b7c7dc; font-size:1rem; margin:0; }
-.audio-preview { background:rgba(17,29,49,.88); border:1px solid rgba(66,217,232,.28); border-radius:16px; padding:16px 18px; margin:12px 0 18px; }
-.section-kicker { color:#42d9e8; font-size:.76rem; letter-spacing:1.5px; font-weight:700; text-transform:uppercase; }
-div[data-testid="stAudio"] { width:100%; }
-.stTabs [data-baseweb="tab-list"] { gap:8px; }
-.stTabs [data-baseweb="tab"] { background:#14243a; border-radius:10px 10px 0 0; padding:10px 16px; }
-.pill { display:inline-block; border:1px solid rgba(66,217,232,.35); color:#9df3f4; border-radius:99px; padding:5px 11px; font-size:.75rem; margin:14px 7px 0 0; background:rgba(66,217,232,.07); }
-.feature { background:rgba(17,29,49,.86); border:1px solid var(--line); padding:15px 16px; border-radius:14px; min-height:100px; }
-.feature b { color:#f4f8ff; display:block; margin-bottom:5px; }
-.feature span { color:var(--muted); font-size:.84rem; }
-.metric-card { background:linear-gradient(145deg,rgba(22,43,67,.95),rgba(15,27,45,.95)); border:1px solid var(--line); border-radius:16px; padding:17px 18px; }
-.metric-label { color:var(--muted); font-size:.8rem; }
-.metric-value { color:#fff; font:700 1.55rem 'Space Grotesk',sans-serif; margin-top:5px; }
-div[data-testid="stFileUploader"], div[data-testid="stAudioInput"] { background:rgba(17,29,49,.65); border:1px dashed rgba(66,217,232,.35); border-radius:14px; padding:12px; }
-.stButton>button { border-radius:10px; border:1px solid rgba(66,217,232,.45); background:linear-gradient(90deg,#087f91,#13a7ad); color:white; font-weight:700; min-height:42px; }
-.stButton>button:hover { border-color:#8af4f4; color:white; }
-section[data-testid="stSidebar"] { background:#0b1627; border-right:1px solid var(--line); }
-small, .muted { color:var(--muted); }
-hr { border-color:var(--line); }
+.stApp{background:radial-gradient(ellipse at 15% 0%,#153252 0%,#0a1323 44%,#080f1b 100%);color:#eaf2ff}
+html,body,[class*="css"]{font-family:'DM Sans',sans-serif}
+h1,h2,h3{font-family:'Space Grotesk',sans-serif!important;color:#f4f8ff!important}
+.block-container{max-width:1400px;padding-top:2rem}
+section[data-testid="stSidebar"]{background:#0b1627}
+.hero,.card{border:1px solid rgba(66,217,232,.25);border-radius:18px;padding:22px;background:linear-gradient(120deg,rgba(20,54,82,.92),rgba(16,29,49,.92));margin-bottom:18px}
+.kicker{color:#42d9e8;font-weight:700;letter-spacing:1.6px;text-transform:uppercase;font-size:.75rem}
+.metric{background:#13243a;border:1px solid #29415c;border-radius:14px;padding:16px}
+div.stButton>button{background:linear-gradient(90deg,#087f91,#13a7ad);color:white;border:0;border-radius:10px;font-weight:700}
 </style>
 """, unsafe_allow_html=True)
 
-# ---------- Public user accounts (SQLite + PBKDF2) ----------
-DB_PATH = Path(os.getenv("VOICEGUARD_DB_PATH", str(Path(__file__).resolve().parent / "voiceguard_users.db")))
-MAX_PROFILE_BYTES = 2 * 1024 * 1024
+def db():
+    con = sqlite3.connect(DB_PATH, check_same_thread=False)
+    con.row_factory = sqlite3.Row
+    return con
 
+def init_db():
+    with db() as c:
+        c.executescript("""
+        CREATE TABLE IF NOT EXISTS users(
+          id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, email TEXT UNIQUE NOT NULL,
+          phone TEXT DEFAULT '', password_hash TEXT NOT NULL, role TEXT DEFAULT 'user',
+          verified INTEGER DEFAULT 0, is_blocked INTEGER DEFAULT 0, two_fa INTEGER DEFAULT 0,
+          created_at TEXT NOT NULL, last_login TEXT
+        );
+        CREATE TABLE IF NOT EXISTS otp_codes(
+          id INTEGER PRIMARY KEY AUTOINCREMENT, email TEXT NOT NULL, purpose TEXT NOT NULL,
+          code_hash TEXT NOT NULL, expires_at REAL NOT NULL, attempts INTEGER DEFAULT 0,
+          created_at REAL NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS login_events(
+          id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, email TEXT, event TEXT,
+          ip TEXT DEFAULT 'Unavailable', user_agent TEXT DEFAULT 'Unavailable', created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS analyses(
+          id TEXT PRIMARY KEY, user_id INTEGER NOT NULL, filename TEXT, prediction TEXT,
+          real_score REAL, fake_score REAL, metrics_json TEXT, sha256 TEXT,
+          created_at TEXT NOT NULL
+        );
+        """)
+        # Admin is provisioned from environment only; no hard-coded default password.
+        admin_email = config_value("ADMIN_EMAIL", "").strip().lower()
+        admin_password = config_value("ADMIN_PASSWORD", "")
+        if admin_email and admin_password and not c.execute("SELECT 1 FROM users WHERE email=?", (admin_email,)).fetchone():
+            c.execute("INSERT INTO users(name,email,password_hash,role,verified,created_at) VALUES(?,?,?,?,?,?)",
+                      ("Administrator", admin_email, hash_password(admin_password), "admin", 1, now()))
 
-def db_connect():
-    conn = sqlite3.connect(DB_PATH, timeout=20)
-    conn.row_factory = sqlite3.Row
-    return conn
-
-
-def init_user_db():
-    with db_connect() as conn:
-        conn.execute("""CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            full_name TEXT NOT NULL,
-            username TEXT NOT NULL COLLATE NOCASE UNIQUE,
-            email TEXT NOT NULL COLLATE NOCASE UNIQUE,
-            mobile TEXT NOT NULL,
-            email_verified INTEGER NOT NULL DEFAULT 0,
-            mobile_verified INTEGER NOT NULL DEFAULT 0,
-            password_hash TEXT NOT NULL,
-            password_salt TEXT NOT NULL,
-            profile_image BLOB,
-            created_at TEXT NOT NULL
-        )""")
-
-
-        columns = {row[1] for row in conn.execute("PRAGMA table_info(users)").fetchall()}
-        if "email_verified" not in columns:
-            conn.execute("ALTER TABLE users ADD COLUMN email_verified INTEGER NOT NULL DEFAULT 0")
-        if "mobile_verified" not in columns:
-            conn.execute("ALTER TABLE users ADD COLUMN mobile_verified INTEGER NOT NULL DEFAULT 0")
-        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_mobile_unique ON users(mobile)")
-        if "is_blocked" not in columns:
-            conn.execute("ALTER TABLE users ADD COLUMN is_blocked INTEGER NOT NULL DEFAULT 0")
-        conn.execute("""CREATE TABLE IF NOT EXISTS login_activity (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            email TEXT NOT NULL,
-            event TEXT NOT NULL,
-            created_at TEXT NOT NULL
-        )""")
-
-
-def setting(name, default=None):
-    try:
-        value = st.secrets.get(name, default)
-    except Exception:
-        value = default
-    return os.getenv(name, value)
-
-
-def log_activity(user_id, email, event):
-    with db_connect() as conn:
-        conn.execute(
-            "INSERT INTO login_activity (user_id, email, event, created_at) VALUES (?, ?, ?, ?)",
-            (user_id, email.strip().lower(), event, datetime.now().isoformat(timespec="seconds"))
-        )
-
-
-def admin_credentials_valid(email, password):
-    admin_email = str(setting("ADMIN_EMAIL", "") or "").strip().lower()
-    admin_password = str(setting("ADMIN_PASSWORD", "") or "")
-    return bool(admin_email and admin_password) and (
-        hmac.compare_digest(email.strip().lower(), admin_email)
-        and hmac.compare_digest(password, admin_password)
-    )
-
-
-def render_admin_portal():
-    st.markdown("""
-    <div class="hero">
-      <div class="hero-kicker">Restricted administrator access</div>
-      <div class="hero-title">🛡️ VoiceGuard AI · Admin Console</div>
-      <p class="hero-sub">Manage registered accounts and review sign-in activity.</p>
-    </div>
-    """, unsafe_allow_html=True)
-    with st.sidebar:
-        st.markdown("## 🛡️ Admin")
-        st.success("Administrator session")
-        if st.button("Admin logout", use_container_width=True):
-            st.session_state.vg_admin = False
-            st.rerun()
-
-    with db_connect() as conn:
-        users = pd.read_sql_query(
-            """SELECT id, full_name, username, email, mobile, email_verified,
-                      mobile_verified, is_blocked, created_at
-               FROM users ORDER BY id DESC""", conn
-        )
-        activity = pd.read_sql_query(
-            "SELECT id, user_id, email, event, created_at FROM login_activity ORDER BY id DESC LIMIT 1000",
-            conn
-        )
-
-    total = len(users)
-    blocked = int(users["is_blocked"].sum()) if total else 0
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Registered users", total)
-    c2.metric("Blocked users", blocked)
-    c3.metric("Recent activity events", len(activity))
-    st.markdown("### 👥 User management")
-    if total:
-        st.dataframe(users, use_container_width=True, hide_index=True)
-        options = {f"{row.email} · {row.full_name} (ID {row.id})": int(row.id)
-                   for row in users.itertuples()}
-        selected_label = st.selectbox("Select a user", list(options.keys()))
-        selected_id = options[selected_label]
-        selected = users.loc[users["id"] == selected_id].iloc[0]
-        b1, b2 = st.columns(2)
-        if int(selected["is_blocked"]) == 0:
-            if b1.button("🚫 Block selected user", type="primary", use_container_width=True):
-                with db_connect() as conn:
-                    conn.execute("UPDATE users SET is_blocked = 1 WHERE id = ?", (selected_id,))
-                st.success("User blocked.")
-                st.rerun()
-        else:
-            if b1.button("✅ Unblock selected user", type="primary", use_container_width=True):
-                with db_connect() as conn:
-                    conn.execute("UPDATE users SET is_blocked = 0 WHERE id = ?", (selected_id,))
-                st.success("User unblocked.")
-                st.rerun()
-        if b2.button("🗑️ Delete selected user", use_container_width=True):
-            st.session_state.vg_confirm_delete_user = selected_id
-        if st.session_state.get("vg_confirm_delete_user") == selected_id:
-            st.warning("This permanently deletes the selected account. This action cannot be undone.")
-            yes, no = st.columns(2)
-            if yes.button("Confirm permanent delete", type="primary"):
-                with db_connect() as conn:
-                    conn.execute("DELETE FROM users WHERE id = ?", (selected_id,))
-                    conn.execute("UPDATE login_activity SET user_id = NULL WHERE user_id = ?", (selected_id,))
-                st.session_state.pop("vg_confirm_delete_user", None)
-                st.success("User deleted.")
-                st.rerun()
-            if no.button("Cancel delete"):
-                st.session_state.pop("vg_confirm_delete_user", None)
-                st.rerun()
-        st.download_button("⬇️ Download users CSV", users.to_csv(index=False), "voiceguard_users.csv",
-                           "text/csv", use_container_width=True)
-    else:
-        st.info("No registered users yet.")
-    st.markdown("### 🕒 Login & account activity")
-    if len(activity):
-        st.dataframe(activity, use_container_width=True, hide_index=True)
-        st.download_button("⬇️ Download activity CSV", activity.to_csv(index=False),
-                           "voiceguard_login_activity.csv", "text/csv", use_container_width=True)
-    else:
-        st.info("No activity has been recorded yet.")
-    st.caption("Privacy note: only account details and events recorded by this app are shown. IP addresses and device fingerprints are not collected.")
-
-
-def normalize_indian_mobile(value):
-    digits = re.sub(r"\D", "", value)
-    if digits.startswith("91") and len(digits) == 12:
-        digits = digits[2:]
-    if len(digits) != 10 or digits[0] not in "6789":
-        return None
-    return "+91" + digits
-
-
-def send_email_otp(destination, code):
-    sender = setting("SMTP_EMAIL")
-    app_password = setting("SMTP_APP_PASSWORD")
-    if not sender or not app_password:
-        raise RuntimeError("Gmail OTP is not configured. Add SMTP_EMAIL and SMTP_APP_PASSWORD to Streamlit Secrets.")
-    msg = EmailMessage()
-    msg["Subject"] = "Your VoiceGuard AI verification code"
-    msg["From"] = sender
-    msg["To"] = destination
-    msg.set_content(f"Your VoiceGuard AI verification code is {code}. It expires in 10 minutes. Do not share it.")
-    with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=20) as server:
-        server.login(sender, app_password)
-        server.send_message(msg)
-
-
-def send_mobile_otp(destination, code):
-    sid = setting("TWILIO_ACCOUNT_SID")
-    token = setting("TWILIO_AUTH_TOKEN")
-    from_number = setting("TWILIO_FROM_NUMBER")
-    if not sid or not token or not from_number:
-        raise RuntimeError("SMS OTP is not configured. Add TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN and TWILIO_FROM_NUMBER to Streamlit Secrets.")
-    response = requests.post(
-        f"https://api.twilio.com/2010-04-01/Accounts/{sid}/Messages.json",
-        data={"To": destination, "From": from_number,
-              "Body": f"Your VoiceGuard AI verification code is {code}. It expires in 10 minutes."},
-        auth=(sid, token), timeout=20)
-    if response.status_code >= 300:
-        raise RuntimeError("SMS provider rejected the request. Check Twilio credentials, sender number and account balance.")
-
-
-def send_both_otps(email, mobile):
-    email_code = f"{secrets.randbelow(1_000_000):06d}"
-    mobile_code = f"{secrets.randbelow(1_000_000):06d}"
-    send_email_otp(email, email_code)
-    send_mobile_otp(mobile, mobile_code)
-    return hashlib.sha256(email_code.encode()).hexdigest(), hashlib.sha256(mobile_code.encode()).hexdigest()
+def now():
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 def hash_password(password, salt=None):
-    salt = salt or secrets.token_hex(16)
-    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt.encode("utf-8"), 310_000).hex()
-    return digest, salt
+    salt = salt or secrets.token_bytes(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, 310000)
+    return salt.hex() + "$" + digest.hex()
 
-
-def create_account(full_name, username, email, mobile, password, profile_image):
-    digest, salt = hash_password(password)
+def verify_password(password, stored):
     try:
-        with db_connect() as conn:
-            conn.execute("""INSERT INTO users
-                (full_name, username, email, mobile, email_verified, mobile_verified,
-                 password_hash, password_salt, profile_image, created_at)
-                VALUES (?, ?, ?, ?, 1, 1, ?, ?, ?, ?)""",
-                (full_name.strip(), username.strip(), email.strip().lower(), mobile.strip(), digest, salt,
-                 profile_image, datetime.now().isoformat(timespec="seconds")))
-        return True, "Account created. Gmail and mobile are verified. You can now sign in."
-    except sqlite3.IntegrityError:
-        return False, "That username, Gmail or mobile number is already registered. Each Gmail and mobile can be used for only one account."
+        salt_hex, digest_hex = stored.split("$", 1)
+        candidate = hashlib.pbkdf2_hmac("sha256", password.encode(), bytes.fromhex(salt_hex), 310000).hex()
+        return hmac.compare_digest(candidate, digest_hex)
+    except Exception:
+        return False
 
+def send_email(to, subject, body):
+    host=config_value("SMTP_HOST"); port=int(config_value("SMTP_PORT","587"))
+    username=config_value("SMTP_USERNAME"); password=config_value("SMTP_PASSWORD")
+    sender=config_value("SMTP_FROM", username or "")
+    if not all([host, username, password, sender]):
+        return False, "Email is not configured. Add SMTP settings in the .env file."
+    msg=EmailMessage(); msg["Subject"]=subject; msg["From"]=sender; msg["To"]=to; msg.set_content(body)
+    try:
+        with smtplib.SMTP(host, port, timeout=20) as server:
+            server.starttls(); server.login(username,password); server.send_message(msg)
+        return True, "Email sent."
+    except Exception as e:
+        return False, f"Email delivery failed: {e}"
 
-def authenticate_user(identifier, password):
-    with db_connect() as conn:
-        user = conn.execute("SELECT * FROM users WHERE username = ? OR email = ?",
-                            (identifier.strip(), identifier.strip().lower())).fetchone()
-    if not user:
-        # Keep a similar password-hash workload for unknown usernames.
-        hash_password(password, "voiceguard_unknown_user_salt")
-        return None
-    candidate, _ = hash_password(password, user["password_salt"])
-    if hmac.compare_digest(candidate, user["password_hash"]):
-        if int(user["is_blocked"]):
-            return {"blocked": True, "email": user["email"]}
-        return {"id": user["id"], "full_name": user["full_name"], "username": user["username"],
-                "email": user["email"], "mobile": user["mobile"], "profile_image": user["profile_image"]}
-    return None
+def issue_otp(email, purpose):
+    otp_secret = config_value("OTP_SECRET", "")
+    if len(otp_secret) < 32:
+        return False, "OTP_SECRET missing/too short. Add a unique 32+ character secret in Streamlit Secrets."
+    with db() as c:
+        recent=c.execute("SELECT created_at FROM otp_codes WHERE email=? AND purpose=? ORDER BY id DESC LIMIT 1",(email,purpose)).fetchone()
+        if recent and time.time()-recent["created_at"] < 60:
+            return False, "Please wait 60 seconds before requesting another code."
+        code=f"{secrets.randbelow(1000000):06d}"
+        digest=hashlib.sha256((code+otp_secret).encode()).hexdigest()
+        c.execute("DELETE FROM otp_codes WHERE email=? AND purpose=?", (email,purpose))
+        c.execute("INSERT INTO otp_codes(email,purpose,code_hash,expires_at,created_at) VALUES(?,?,?,?,?)",
+                  (email,purpose,digest,time.time()+600,time.time()))
+    ok,msg=send_email(email, f"Your VoiceGuard {purpose} code", f"Your verification code is {code}. It expires in 10 minutes. Do not share it.")
+    return ok,msg
 
+def verify_otp(email,purpose,code):
+    otp_secret = config_value("OTP_SECRET", "")
+    if len(otp_secret) < 32:
+        return False
+    with db() as c:
+        row=c.execute("SELECT * FROM otp_codes WHERE email=? AND purpose=? ORDER BY id DESC LIMIT 1",(email,purpose)).fetchone()
+        if not row or row["expires_at"] < time.time() or row["attempts"] >= 5:
+            return False
+        digest=hashlib.sha256((code+otp_secret).encode()).hexdigest()
+        if hmac.compare_digest(digest,row["code_hash"]):
+            c.execute("DELETE FROM otp_codes WHERE email=? AND purpose=?", (email,purpose))
+            return True
+        c.execute("UPDATE otp_codes SET attempts=attempts+1 WHERE id=?", (row["id"],))
+        return False
 
-init_user_db()
+def log_event(user_id,email,event):
+    with db() as c:
+        c.execute("INSERT INTO login_events(user_id,email,event,created_at) VALUES(?,?,?,?)",(user_id,email,event,now()))
 
-if "vg_user" not in st.session_state:
-    st.session_state.vg_user = None
-if "vg_admin" not in st.session_state:
-    st.session_state.vg_admin = False
-if "vg_login_failures" not in st.session_state:
-    st.session_state.vg_login_failures = 0
-if "vg_lock_until" not in st.session_state:
-    st.session_state.vg_lock_until = 0.0
+def current_user():
+    if "user_id" not in st.session_state: return None
+    with db() as c:
+        return c.execute("SELECT * FROM users WHERE id=?", (st.session_state.user_id,)).fetchone()
 
-if not st.session_state.vg_user:
-    st.markdown("""
-    <div class="hero">
-      <div class="hero-kicker">Create your account · Secure access</div>
-      <div class="hero-title">🛡️ VoiceGuard AI</div>
-      <p class="hero-sub">Create a personal account or sign in to access AI voice screening.</p>
-      <span class="pill">Personal account</span><span class="pill">Password protected</span><span class="pill">Version 3.1.0</span>
-    </div>
-    """, unsafe_allow_html=True)
-    register_tab, login_tab, admin_tab = st.tabs(["✨ Create account", "🔐 Sign in", "🛡️ Admin"])
-    with register_tab:
-        st.markdown("### Join VoiceGuard AI")
-        st.caption("Both your Gmail inbox and Indian mobile number must be verified before an account is created.")
-        pending = st.session_state.get("vg_reg_pending")
-        if not pending:
-            with st.form("voiceguard_register_form", clear_on_submit=True):
-                c1, c2 = st.columns(2)
-                with c1:
-                    full_name = st.text_input("Full name", max_chars=80, placeholder="Your name")
-                    username = st.text_input("Username", max_chars=24, placeholder="Choose a username")
-                    email = st.text_input("Gmail address", max_chars=254, placeholder="name@gmail.com")
-                with c2:
-                    mobile_input = st.text_input("Indian mobile number", max_chars=16, placeholder="10-digit number")
-                    new_password = st.text_input("Password", type="password", help="Use at least 12 characters.")
-                    confirm_password = st.text_input("Confirm password", type="password")
-                profile_file = st.file_uploader("Profile picture (optional, JPG/PNG/WebP; max 2 MB)", type=["jpg", "jpeg", "png", "webp"], accept_multiple_files=False)
-                agree = st.checkbox("I agree that my account details will be stored by this app.")
-                send_codes = st.form_submit_button("Verify Gmail & mobile", type="primary", use_container_width=True)
-            if send_codes:
-                errors = []
-                clean_email = email.strip().lower()
-                clean_mobile = normalize_indian_mobile(mobile_input)
-                if len(full_name.strip()) < 2: errors.append("Enter your full name.")
-                if not re.fullmatch(r"[A-Za-z0-9_.]{3,24}", username.strip()): errors.append("Username must be 3–24 characters and use only letters, numbers, dot or underscore.")
-                if not re.fullmatch(r"[A-Za-z0-9._%+-]+@gmail\.com", clean_email, re.I): errors.append("Enter a correctly formatted @gmail.com address.")
-                if not clean_mobile: errors.append("Enter a valid Indian mobile number starting with 6, 7, 8 or 9.")
-                if len(new_password) < 12: errors.append("Password must be at least 12 characters.")
-                if new_password != confirm_password: errors.append("Passwords do not match.")
-                if not agree: errors.append("Please accept the account data notice.")
-                photo_bytes = None
-                if profile_file is not None:
-                    photo_bytes = profile_file.getvalue()
-                    if len(photo_bytes) > MAX_PROFILE_BYTES:
-                        errors.append("Profile picture must be 2 MB or smaller.")
-                    else:
-                        try:
-                            img = Image.open(io.BytesIO(photo_bytes))
-                            img.verify()
-                            if img.format not in ("JPEG", "PNG", "WEBP"):
-                                errors.append("Use a JPG, PNG or WebP profile picture.")
-                        except Exception:
-                            errors.append("The selected profile picture is not a valid image.")
-                if not errors:
-                    with db_connect() as conn:
-                        exists = conn.execute("SELECT 1 FROM users WHERE username = ? OR email = ? OR mobile = ?",
-                                              (username.strip(), clean_email, clean_mobile)).fetchone()
-                    if exists:
-                        errors.append("This username, Gmail or mobile is already registered. Each Gmail and mobile can be used once.")
-                if errors:
-                    for error in errors: st.error(error)
-                else:
-                    try:
-                        email_hash, mobile_hash = send_both_otps(clean_email, clean_mobile)
-                        st.session_state.vg_reg_pending = {
-                            "full_name": full_name.strip(), "username": username.strip(), "email": clean_email,
-                            "mobile": clean_mobile, "password": new_password, "profile_image": photo_bytes,
-                            "email_otp_hash": email_hash, "mobile_otp_hash": mobile_hash,
-                            "expires_at": time.time() + 600, "attempts": 0
-                        }
-                        st.success("Verification codes sent. Check your Gmail inbox and SMS messages.")
-                        st.rerun()
-                    except Exception as exc:
-                        st.error(f"Could not send verification codes: {exc}")
-        else:
-            st.info(f"Codes sent to {pending['email']} and {pending['mobile']}. They expire in 10 minutes.")
-            with st.form("voiceguard_verify_form", clear_on_submit=True):
-                email_code = st.text_input("Gmail verification code", max_chars=6)
-                mobile_code = st.text_input("Mobile verification code", max_chars=6)
-                verify = st.form_submit_button("Verify and create account", type="primary", use_container_width=True)
-            if st.button("Cancel registration", use_container_width=True):
-                st.session_state.pop("vg_reg_pending", None)
-                st.rerun()
-            if verify:
-                if time.time() > pending["expires_at"] or pending["attempts"] >= 5:
-                    st.session_state.pop("vg_reg_pending", None)
-                    st.error("Codes expired or too many incorrect attempts. Start registration again.")
-                else:
-                    e_ok = hmac.compare_digest(hashlib.sha256(email_code.strip().encode()).hexdigest(), pending["email_otp_hash"])
-                    m_ok = hmac.compare_digest(hashlib.sha256(mobile_code.strip().encode()).hexdigest(), pending["mobile_otp_hash"])
-                    if not (e_ok and m_ok):
-                        pending["attempts"] += 1
-                        st.session_state.vg_reg_pending = pending
-                        st.error("One or both codes are incorrect. Please try again.")
-                    else:
-                        ok, message = create_account(pending["full_name"], pending["username"], pending["email"],
-                                                     pending["mobile"], pending["password"], pending["profile_image"])
-                        st.session_state.pop("vg_reg_pending", None)
-                        if ok: st.success(message + " Open the Sign in tab.")
-                        else: st.error(message)
-    with login_tab:
-        st.markdown("### Welcome back")
-        remaining = st.session_state.vg_lock_until - time.time()
-        with st.form("voiceguard_login_form", clear_on_submit=True):
-            identifier = st.text_input("Username or Gmail")
-            login_password = st.text_input("Password", type="password")
-            login_submitted = st.form_submit_button("Sign in to VoiceGuard AI", type="primary", use_container_width=True)
-        if remaining > 0:
-            st.warning(f"Too many failed attempts. Try again in {int(remaining) + 1} seconds.")
-        elif login_submitted:
-            user = authenticate_user(identifier, login_password)
-            if user and user.get("blocked"):
-                log_activity(None, user["email"], "BLOCKED_LOGIN_ATTEMPT")
-                st.error("This account has been blocked by the administrator.")
-            elif user:
-                st.session_state.vg_user = user
-                log_activity(user["id"], user["email"], "LOGIN_SUCCESS")
-                st.session_state.vg_login_failures = 0
-                st.session_state.vg_lock_until = 0.0
-                st.rerun()
-            else:
-                log_activity(None, identifier if "@" in identifier else "unknown", "LOGIN_FAILED")
-                st.session_state.vg_login_failures += 1
-                if st.session_state.vg_login_failures >= 5:
-                    st.session_state.vg_lock_until = time.time() + 60
-                    st.session_state.vg_login_failures = 0
-                    st.error("Too many incorrect attempts. Sign in is paused for 60 seconds.")
-                else:
-                    st.error(f"Incorrect username/Gmail or password. {5 - st.session_state.vg_login_failures} attempts remaining.")
-        st.caption("You must create an account and sign in before the dashboard or audio tools become available.")
-    with admin_tab:
-        st.markdown("### Administrator sign in")
-        st.caption("Use ADMIN_EMAIL and ADMIN_PASSWORD configured in Streamlit Cloud → Settings → Secrets.")
-        with st.form("voiceguard_admin_login_form", clear_on_submit=True):
-            admin_email_input = st.text_input("Admin Gmail")
-            admin_password_input = st.text_input("Admin password", type="password")
-            admin_submit = st.form_submit_button("Open Admin Console", type="primary", use_container_width=True)
-        if admin_submit:
-            if admin_credentials_valid(admin_email_input, admin_password_input):
-                st.session_state.vg_admin = True
-                log_activity(None, admin_email_input, "ADMIN_LOGIN_SUCCESS")
-                st.rerun()
-            else:
-                log_activity(None, admin_email_input or "unknown", "ADMIN_LOGIN_FAILED")
-                st.error("Admin credentials do not match Streamlit Secrets.")
-    if st.session_state.vg_admin:
-        render_admin_portal()
-        st.stop()
-    st.stop()
-
-FEATURES = [
-    ("🎙️", "Live recording & upload", "Record audio or upload common audio formats."),
-    ("📚", "Batch audio analysis", "Analyze multiple recordings in one session."),
-    ("🧠", "AI deepfake screening", "Run an existing pretrained audio-classification model."),
-    ("📊", "Real / fake score breakdown", "Review the model's raw class scores."),
-    ("〰️", "Waveform & spectrogram", "Explore audio patterns and acoustic metrics."),
-    ("💬", "Speech transcription", "Optional Whisper Tiny transcript."),
-    ("📄", "Export & session history", "Download reports and review this session's results."),
-]
-
-st.markdown("""
-<div class="hero">
-  <div class="hero-kicker">Audio authenticity screening platform · Version 3.1.0</div>
-  <div class="hero-title">🛡️ VoiceGuard AI</div>
-  <p class="hero-sub">AI-powered voice clone and deepfake audio screening assistant.</p>
-  <span class="pill">Wav2Vec2 detector</span><span class="pill">Audio forensics</span><span class="pill">Privacy-aware workflow</span>
-</div>
-""", unsafe_allow_html=True)
-
-with st.expander("✨ Explore the 7 project features", expanded=False):
-    cols = st.columns(2)
-    for i, (icon, name, desc) in enumerate(FEATURES):
-        cols[i % 2].markdown(f'<div class="feature"><b>{icon} {i+1}. {name}</b><span>{desc}</span></div>', unsafe_allow_html=True)
-
-if "history" not in st.session_state:
-    st.session_state.history = []
-if "results" not in st.session_state:
-    st.session_state.results = {}
-
-@st.cache_resource(show_spinner="Loading the AI detector (first run may take a few minutes)...")
+@st.cache_resource(show_spinner="Loading pretrained voice detector (first run downloads model)...")
 def load_detector():
-    extractor = AutoFeatureExtractor.from_pretrained(DETECTOR_ID)
-    model = AutoModelForAudioClassification.from_pretrained(DETECTOR_ID)
+    extractor=AutoFeatureExtractor.from_pretrained(DETECTOR_ID)
+    model=AutoModelForAudioClassification.from_pretrained(DETECTOR_ID)
     model.eval()
-    return extractor, model
+    return extractor,model
 
-@st.cache_resource(show_spinner="Loading Whisper Tiny...")
-def load_asr():
-    from transformers import pipeline
-    return pipeline("automatic-speech-recognition", model=ASR_ID, device=-1)
-
-def decode_audio(raw_bytes):
-    with tempfile.NamedTemporaryFile(suffix=".audio", delete=False) as tmp:
-        tmp.write(raw_bytes)
-        path = tmp.name
+def decode_audio(raw, suffix):
+    import tempfile
+    path=None
     try:
-        audio, sr = librosa.load(path, sr=TARGET_SR, mono=True)
+        with tempfile.NamedTemporaryFile(suffix=suffix,delete=False) as f:
+            f.write(raw); path=f.name
+        audio,sr=librosa.load(path,sr=TARGET_SR,mono=True)
     finally:
-        try:
-            os.remove(path)
-        except OSError:
-            pass
-    if audio.size == 0:
-        raise ValueError("The audio file appears to be empty or unsupported.")
-    return audio.astype(np.float32), sr
+        if path and os.path.exists(path): os.remove(path)
+    if audio.size==0: raise ValueError("Audio is empty or unsupported.")
+    duration=len(audio)/sr
+    if duration>MAX_DURATION_SEC: raise ValueError(f"Audio exceeds {MAX_DURATION_SEC} seconds.")
+    return audio.astype(np.float32),sr
 
-def get_label_map(model):
-    mapping = getattr(model.config, "id2label", {}) or {}
-    return {int(k): str(v) for k, v in mapping.items()}
+def classify(audio,sr):
+    extractor,model=load_detector()
+    inputs=extractor(audio,sampling_rate=sr,return_tensors="pt",padding=True)
+    with torch.inference_mode(): probs=torch.softmax(model(**inputs).logits,dim=-1)[0].cpu().numpy()
+    labels={int(k):str(v) for k,v in (model.config.id2label or {}).items()}
+    scores={labels.get(i,f"class_{i}"):float(p) for i,p in enumerate(probs)}
+    fake=next((v for k,v in scores.items() if "fake" in k.lower() or "spoof" in k.lower()),None)
+    real=next((v for k,v in scores.items() if "real" in k.lower() or "bonafide" in k.lower()),None)
+    return scores,max(scores,key=scores.get),real,fake
 
-def classify_audio(audio, sr):
-    extractor, model = load_detector()
-    inputs = extractor(audio, sampling_rate=sr, return_tensors="pt", padding=True)
-    with torch.inference_mode():
-        logits = model(**inputs).logits
-        probs = torch.softmax(logits, dim=-1)[0].cpu().numpy()
-    labels = get_label_map(model)
-    scores = {labels.get(i, f"class_{i}"): float(p) for i, p in enumerate(probs)}
-    # The checkpoint commonly labels classes as REAL/FAKE; preserve the model's own labels.
-    fake_key = next((k for k in scores if "fake" in k.lower() or "spoof" in k.lower()), None)
-    real_key = next((k for k in scores if "real" in k.lower() or "bonafide" in k.lower() or "bonafide" in k.lower()), None)
-    if fake_key is None or real_key is None:
-        ordered = sorted(scores.items(), key=lambda x: x[1], reverse=True)
-        predicted = ordered[0][0]
-        return scores, predicted, None, None
-    predicted = max(scores, key=scores.get)
-    return scores, predicted, scores[real_key], scores[fake_key]
-
-def audio_metrics(audio, sr):
-    duration = len(audio) / sr
-    rms = float(np.sqrt(np.mean(np.square(audio))))
-    peak = float(np.max(np.abs(audio)))
-    zcr = float(np.mean(librosa.feature.zero_crossing_rate(y=audio)))
-    centroid = float(np.mean(librosa.feature.spectral_centroid(y=audio, sr=sr)))
-    return {"Duration (seconds)": round(duration, 2), "Sample rate (Hz)": sr,
-            "RMS energy": round(rms, 5), "Peak amplitude": round(peak, 5),
-            "Zero-crossing rate": round(zcr, 5), "Spectral centroid (Hz)": round(centroid, 2)}
+def metrics(audio,sr):
+    return {"Duration (seconds)":round(len(audio)/sr,2),"Sample rate (Hz)":sr,
+      "RMS energy":round(float(np.sqrt(np.mean(audio**2))),5),
+      "Peak amplitude":round(float(np.max(np.abs(audio))),5),
+      "Zero-crossing rate":round(float(np.mean(librosa.feature.zero_crossing_rate(y=audio))),5),
+      "Spectral centroid (Hz)":round(float(np.mean(librosa.feature.spectral_centroid(y=audio,sr=sr))),2)}
 
 def make_pdf(result):
     from reportlab.lib.pagesizes import A4
+    from reportlab.platypus import SimpleDocTemplate,Paragraph,Spacer,Table,TableStyle
     from reportlab.lib import colors
-    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
-    buffer = io.BytesIO()
-    doc = SimpleDocTemplate(buffer, pagesize=A4, rightMargin=42, leftMargin=42, topMargin=42, bottomMargin=42)
-    styles = getSampleStyleSheet()
-    styles.add(ParagraphStyle(name="Subtle", parent=styles["Normal"], textColor=colors.HexColor("#526174"), leading=15))
-    story = [Paragraph("VoiceGuard AI — Audio Screening Report", styles["Title"]), Spacer(1, 8),
-             Paragraph(f"File: {result['filename']}<br/>Generated: {result['timestamp']}", styles["Subtle"]), Spacer(1, 18)]
-    rows = [["Model output", result["prediction"]]]
-    if result.get("real_score") is not None:
-        rows += [["Real score (raw)", f"{result['real_score']*100:.2f}%"], ["Fake score (raw)", f"{result['fake_score']*100:.2f}%"]]
-    rows += [[k, str(v)] for k, v in result["metrics"].items()]
-    table = Table(rows, colWidths=[190, 290])
-    table.setStyle(TableStyle([("BACKGROUND", (0,0), (-1,0), colors.HexColor("#e8f3f7")), ("GRID",(0,0),(-1,-1),.4,colors.HexColor("#cbd5e1")), ("PADDING",(0,0),(-1,-1),8), ("VALIGN",(0,0),(-1,-1),"TOP")]))
-    story += [table, Spacer(1, 18), Paragraph("Important limitation", styles["Heading2"]),
-              Paragraph("Scores are raw model outputs, not calibrated probabilities. This screening result is not proof of authenticity, identity, or fraud. False positives and false negatives are possible. Review the audio and use independent verification.", styles["BodyText"])]
-    doc.build(story)
-    buffer.seek(0)
-    return buffer.getvalue()
+    from reportlab.lib.styles import getSampleStyleSheet
+    b=io.BytesIO(); doc=SimpleDocTemplate(b,pagesize=A4); styles=getSampleStyleSheet()
+    rows=[["Analysis ID",result["id"]],["File",result["filename"]],["Timestamp",result["created_at"]],["Prediction",result["prediction"]]]
+    if result["real_score"] is not None: rows += [["Real raw score",f'{result["real_score"]*100:.2f}%'],["Fake raw score",f'{result["fake_score"]*100:.2f}%']]
+    rows += [[k,str(v)] for k,v in result["metrics"].items()]
+    table=Table(rows,colWidths=[170,330]); table.setStyle(TableStyle([("GRID",(0,0),(-1,-1),.4,colors.grey),("PADDING",(0,0),(-1,-1),8)]))
+    doc.build([Paragraph("VoiceGuard AI — Analysis Report",styles["Title"]),Spacer(1,18),table,Spacer(1,18),
+      Paragraph("Important: model scores are raw outputs, not calibrated probabilities. This result is not proof of authenticity, identity, or fraud. False positives and false negatives are possible.",styles["BodyText"])])
+    return b.getvalue()
 
-def render_result(result, key):
-    st.markdown(f"### 🔎 Analysis: {result['filename']}")
-    st.markdown('<div class="section-kicker">Listen to analyzed recording</div>', unsafe_allow_html=True)
-    st.audio(result["audio"], sample_rate=result["sr"])
-    st.caption("Use the player above to hear the exact audio that was analyzed.")
-    if result.get("real_score") is not None:
-        c1, c2, c3 = st.columns(3)
-        c1.markdown(f'<div class="metric-card"><div class="metric-label">REAL score · raw</div><div class="metric-value">{result["real_score"]*100:.2f}%</div></div>', unsafe_allow_html=True)
-        c2.markdown(f'<div class="metric-card"><div class="metric-label">FAKE score · raw</div><div class="metric-value">{result["fake_score"]*100:.2f}%</div></div>', unsafe_allow_html=True)
-        c3.markdown(f'<div class="metric-card"><div class="metric-label">Top model label</div><div class="metric-value">{result["prediction"]}</div></div>', unsafe_allow_html=True)
-    else:
-        st.info(f"Top model label: **{result['prediction']}**. The checkpoint's class labels could not be mapped confidently to Real/Fake.")
-    if result.get("scores"):
-        st.write("**Model class scores (raw)**")
-        st.bar_chart(pd.DataFrame({"Score": result["scores"]}))
-    with st.expander("🎚️ Audio waveform and spectrogram", expanded=True):
-        a = np.asarray(result["audio"])
-        sr = result["sr"]
-        fig, ax = plt.subplots(figsize=(11, 2.6))
-        librosa.display.waveshow(a, sr=sr, ax=ax)
-        ax.set_title("Waveform"); ax.set_xlabel("Time (seconds)")
-        st.pyplot(fig, clear_figure=True)
-        spec = librosa.feature.melspectrogram(y=a, sr=sr, n_mels=64)
-        spec_db = librosa.power_to_db(spec, ref=np.max)
-        fig2, ax2 = plt.subplots(figsize=(11, 3.4))
-        img = librosa.display.specshow(spec_db, sr=sr, x_axis="time", y_axis="mel", ax=ax2)
-        ax2.set_title("Mel spectrogram"); fig2.colorbar(img, ax=ax2, format="%+2.0f dB")
-        st.pyplot(fig2, clear_figure=True)
-    st.write("**Acoustic metrics**")
-    st.dataframe(pd.DataFrame([result["metrics"]]), use_container_width=True, hide_index=True)
-    d1, d2, d3 = st.columns(3)
-    safe = result["filename"].rsplit(".", 1)[0].replace(" ", "_")
-    d1.download_button("⬇️ Download PDF", make_pdf(result), file_name=f"{safe}_voiceguard_report.pdf", mime="application/pdf", key=f"pdf_{key}")
-    d2.download_button("⬇️ Download JSON", json.dumps({k:v for k,v in result.items() if k not in ("audio", "raw_bytes")}, indent=2, default=str), file_name=f"{safe}_report.json", mime="application/json", key=f"json_{key}")
-    d3.download_button("⬇️ Download CSV", pd.DataFrame([{**{k:v for k,v in result.items() if k not in ("audio", "raw_bytes", "scores")}, "scores": json.dumps(result["scores"])}]).to_csv(index=False), file_name=f"{safe}_report.csv", mime="text/csv", key=f"csv_{key}")
-    if st.button("💬 Generate optional transcript", key=f"asr_{key}"):
-        try:
-            with st.spinner("Transcribing audio with Whisper Tiny..."):
-                asr = load_asr()
-                transcript = asr(a)["text"]
-            st.session_state.results[key]["transcript"] = transcript
-            st.success("Transcript generated")
-            st.write(transcript)
-        except Exception as exc:
-            st.error(f"Transcription failed: {exc}")
-    if result.get("transcript"):
-        st.info("Transcript (may contain recognition errors): " + result["transcript"])
+def auth_ui():
+    st.markdown('<div class="hero"><div class="kicker">Audio authenticity screening platform</div><h1>🛡️ VoiceGuard AI</h1><p>AI voice-clone and deepfake audio screening workspace.</p></div>',unsafe_allow_html=True)
+    tabs=st.tabs(["Login","Create account","Forgot password"])
+    with tabs[0]:
+        with st.form("login_form"):
+            email=st.text_input("Gmail / Email").strip().lower()
+            password=st.text_input("Password",type="password")
+            submit=st.form_submit_button("Login",use_container_width=True)
+        if submit:
+            with db() as c: user=c.execute("SELECT * FROM users WHERE email=?",(email,)).fetchone()
+            if not user or not verify_password(password,user["password_hash"]):
+                log_event(None,email,"LOGIN_FAILED"); st.error("Invalid email or password.")
+            elif user["is_blocked"]:
+                log_event(user["id"],email,"BLOCKED_LOGIN_ATTEMPT"); st.error("This account is blocked. Contact the administrator.")
+            elif not user["verified"]:
+                st.session_state.pending_email=email; st.session_state.pending_purpose="verify"
+                st.warning("Email not verified. Request a verification code in Create account.")
+            elif user["two_fa"]:
+                ok,msg=issue_otp(email,"login")
+                if ok: st.session_state.login_otp_email=email; st.success("Login OTP sent to your email.")
+                else: st.error(msg)
+            else:
+                st.session_state.user_id=user["id"]
+                with db() as c: c.execute("UPDATE users SET last_login=? WHERE id=?",(now(),user["id"]))
+                log_event(user["id"],email,"LOGIN_SUCCESS"); st.rerun()
+        if st.session_state.get("login_otp_email"):
+            st.markdown("**Two-step verification**")
+            otp=st.text_input("6-digit email code",key="login_otp")
+            if st.button("Verify and login"):
+                email=st.session_state.login_otp_email
+                if verify_otp(email,"login",otp):
+                    with db() as c: user=c.execute("SELECT * FROM users WHERE email=?",(email,)).fetchone()
+                    st.session_state.user_id=user["id"]; log_event(user["id"],email,"LOGIN_SUCCESS_2FA")
+                    del st.session_state.login_otp_email; st.rerun()
+                else: st.error("Invalid or expired code.")
+    with tabs[1]:
+        with st.form("signup_form"):
+            name=st.text_input("Full name"); email=st.text_input("Email address").strip().lower()
+            phone=st.text_input("Contact number (optional)")
+            pw=st.text_input("Password",type="password"); confirm=st.text_input("Confirm password",type="password")
+            create=st.form_submit_button("Create account & send OTP",use_container_width=True)
+        if create:
+            if not name.strip() or "@" not in email: st.error("Enter a valid name and email.")
+            elif len(pw)<10 or not any(x.isdigit() for x in pw) or not any(x.isalpha() for x in pw): st.error("Use at least 10 characters with letters and numbers.")
+            elif pw!=confirm: st.error("Passwords do not match.")
+            else:
+                with db() as c: exists=c.execute("SELECT 1 FROM users WHERE email=?",(email,)).fetchone()
+                if exists: st.error("An account with this email already exists.")
+                else:
+                    ok,msg=send_email(email,"Verify your VoiceGuard account","Your account verification code will be sent after account creation.")
+                    # Insert only after mail service is configured; issue actual OTP below.
+                    if not config_value("SMTP_HOST"): st.error("Email OTP is not configured. Set SMTP settings in .env first.")
+                    else:
+                        with db() as c:
+                            c.execute("INSERT INTO users(name,email,phone,password_hash,created_at) VALUES(?,?,?,?,?)",
+                                      (name.strip(),email,phone.strip(),hash_password(pw),now()))
+                        ok,msg=issue_otp(email,"signup")
+                        if ok: st.session_state.signup_otp_email=email; st.success("Account created. Check your email for OTP.")
+                        else: st.error(msg)
+        if st.session_state.get("signup_otp_email"):
+            code=st.text_input("Enter email verification OTP",key="signup_otp")
+            if st.button("Verify email"):
+                email=st.session_state.signup_otp_email
+                if verify_otp(email,"signup",code):
+                    with db() as c: c.execute("UPDATE users SET verified=1 WHERE email=?",(email,))
+                    log_event(None,email,"SIGNUP_VERIFIED"); del st.session_state.signup_otp_email
+                    st.success("Email verified. You can now log in.")
+                else: st.error("Invalid or expired OTP.")
+    with tabs[2]:
+        email=st.text_input("Account email",key="reset_email").strip().lower()
+        if st.button("Send password reset OTP"):
+            with db() as c: user=c.execute("SELECT id FROM users WHERE email=?",(email,)).fetchone()
+            if user:
+                ok,msg=issue_otp(email,"reset")
+                if ok: st.session_state.reset_email=email; st.success("Reset code sent.")
+                else: st.error(msg)
+            else: st.info("If the account exists, a reset email can be sent.")
+        if st.session_state.get("reset_email"):
+            code=st.text_input("Reset OTP",key="reset_code")
+            newpw=st.text_input("New password (10+ characters)",type="password",key="new_pw")
+            if st.button("Reset password"):
+                if len(newpw)<10: st.error("Password must be at least 10 characters.")
+                elif verify_otp(st.session_state.reset_email,"reset",code):
+                    with db() as c: c.execute("UPDATE users SET password_hash=? WHERE email=?",(hash_password(newpw),st.session_state.reset_email))
+                    del st.session_state.reset_email; st.success("Password updated. Please log in.")
+                else: st.error("Invalid or expired OTP.")
 
-# ---------- Sidebar ----------
-with st.sidebar:
-    st.markdown("## 🛡️ VoiceGuard AI")
-    st.caption("Audio screening workspace")
-    st.markdown("---")
-    st.markdown("**Detector**")
-    st.caption("garystafford / wav2vec2-deepfake-voice-detector")
-    user = st.session_state.vg_user
-    if user.get("profile_image"):
-        st.image(user["profile_image"], width=76)
-    st.markdown(f"**{user['full_name']}**")
-    st.caption(f"@{user['username']} · {user['email']}")
-    st.markdown("**Session**")
-    st.metric("Analyzed recordings", len(st.session_state.history))
-    if st.button("🗑️ Clear session history", use_container_width=True):
-        st.session_state.history = []
-        st.session_state.results = {}
-        st.rerun()
-    st.markdown("---")
-    st.caption(f"Version {APP_VERSION}")
-    if st.button("🔒 Log out", use_container_width=True):
-        log_activity(user["id"], user["email"], "LOGOUT")
-        st.session_state.vg_user = None
-        st.session_state.history = []
-        st.session_state.results = {}
-        st.rerun()
-    st.caption("Audio is processed in this app session. Avoid uploading recordings unless you have permission.")
+def user_app(user):
+    with st.sidebar:
+        st.markdown("## 🛡️ VoiceGuard AI"); st.caption(f"Signed in: {user['name']}")
+        page=st.radio("Navigation",["Dashboard","Analyze audio","History","Account settings"])
+        if st.button("Secure logout",use_container_width=True):
+            log_event(user["id"],user["email"],"LOGOUT"); st.session_state.clear(); st.rerun()
+    if page=="Dashboard":
+        st.markdown(f"## Welcome, {user['name']}")
+        with db() as c:
+            total=c.execute("SELECT COUNT(*) n FROM analyses WHERE user_id=?",(user["id"],)).fetchone()["n"]
+            recent=c.execute("SELECT * FROM analyses WHERE user_id=? ORDER BY created_at DESC LIMIT 5",(user["id"],)).fetchall()
+        a,b,d=st.columns(3)
+        for col,label,value in [(a,"Analyses",total),(b,"Email verified","Yes" if user["verified"] else "No"),(d,"Two-step login","On" if user["two_fa"] else "Off")]:
+            col.markdown(f'<div class="metric"><div>{label}</div><h2>{value}</h2></div>',unsafe_allow_html=True)
+        st.subheader("Recent activity")
+        st.dataframe(pd.DataFrame([dict(x) for x in recent]),use_container_width=True,hide_index=True)
+    elif page=="Analyze audio":
+        st.subheader("🎙️ Upload and analyze audio")
+        files=st.file_uploader("MP3, WAV, M4A, FLAC, OGG or AAC",type=["mp3","wav","m4a","flac","ogg","aac"],accept_multiple_files=True)
+        if files:
+            for f in files: st.audio(f.getvalue(),format=mimetypes.guess_type(f.name)[0] or "audio/wav")
+        if st.button("Run AI voice screening",disabled=not files,use_container_width=True):
+            for f in files:
+                raw=f.getvalue()
+                if len(raw)>MAX_UPLOAD_MB*1024*1024: st.error(f"{f.name}: exceeds {MAX_UPLOAD_MB} MB."); continue
+                try:
+                    audio,sr=decode_audio(raw,Path(f.name).suffix or ".audio")
+                    scores,pred,real,fake=classify(audio,sr); met=metrics(audio,sr)
+                    rid=str(uuid.uuid4()); created=now(); digest=hashlib.sha256(raw).hexdigest()
+                    with db() as c:
+                        c.execute("INSERT INTO analyses VALUES(?,?,?,?,?,?,?,?,?)",(rid,user["id"],f.name,pred,real,fake,json.dumps(met),digest,created))
+                    result={"id":rid,"filename":f.name,"prediction":pred,"real_score":real,"fake_score":fake,"metrics":met,"created_at":created}
+                    st.success(f"Analysis complete: {f.name}")
+                    x,y,z=st.columns(3); x.metric("Model label",pred)
+                    if real is not None: y.metric("Real raw score",f"{real*100:.2f}%"); z.metric("Fake raw score",f"{fake*100:.2f}%")
+                    st.bar_chart(pd.DataFrame({"Raw score":scores}))
+                    st.json(met)
+                    st.download_button("Download PDF report",make_pdf(result),file_name=f"VoiceGuard_{rid[:8]}.pdf",mime="application/pdf",key=f"pdf{rid}")
+                    st.caption("Model scores are raw outputs, not calibrated probabilities. This is a screening signal, not proof.")
+                except Exception as e: st.error(f"Could not analyze {f.name}: {e}")
+    elif page=="History":
+        st.subheader("Analysis history")
+        with db() as c: rows=c.execute("SELECT * FROM analyses WHERE user_id=? ORDER BY created_at DESC",(user["id"],)).fetchall()
+        df=pd.DataFrame([dict(r) for r in rows])
+        if not df.empty:
+            st.dataframe(df.drop(columns=["metrics_json","sha256"],errors="ignore"),use_container_width=True,hide_index=True)
+            st.download_button("Export history CSV",df.to_csv(index=False),"voiceguard_history.csv","text/csv")
+            selected=st.selectbox("Delete an analysis record",[""]+[r["id"] for r in rows])
+            if selected and st.button("Delete selected record"):
+                with db() as c: c.execute("DELETE FROM analyses WHERE id=? AND user_id=?",(selected,user["id"]))
+                st.success("Analysis record deleted."); st.rerun()
+        else: st.info("No analyses yet.")
+    elif page=="Account settings":
+        st.subheader("Profile and security")
+        st.write(f"**Name:** {user['name']}  \n**Email:** {user['email']}  \n**Contact:** {user['phone'] or 'Not provided'}")
+        enabled=st.toggle("Require email OTP at every login (2FA)",value=bool(user["two_fa"]))
+        if st.button("Save security settings"):
+            with db() as c: c.execute("UPDATE users SET two_fa=? WHERE id=?",(int(enabled),user["id"]))
+            st.success("Settings saved."); st.rerun()
+        with st.form("profile_form"):
+            name=st.text_input("Update name",value=user["name"]); phone=st.text_input("Update contact",value=user["phone"] or "")
+            if st.form_submit_button("Update profile"):
+                with db() as c: c.execute("UPDATE users SET name=?,phone=? WHERE id=?",(name.strip(),phone.strip(),user["id"]))
+                st.success("Profile updated."); st.rerun()
 
-# ---------- Input ----------
-st.markdown("## 🎙️ Upload, record & listen")
-st.write("Add a recording, listen to it immediately, then run the AI screening. Playback is available both before and after analysis.")
-left, right = st.columns([1.2, 1])
-with left:
-    uploads = st.file_uploader("Choose audio files", type=["wav", "mp3", "m4a", "flac", "ogg", "aac"], accept_multiple_files=True)
-with right:
-    recording = None
-    if hasattr(st, "audio_input"):
-        recording = st.audio_input("Record a voice sample")
-    else:
-        st.info("Live recording needs a newer Streamlit version. File upload is available.")
+def admin_app(admin):
+    with st.sidebar:
+        st.markdown("## 🛡️ Admin Console")
+        page=st.radio("Admin navigation",["Overview","Users","Login activity","Analysis records"])
+        if st.button("Admin logout"): log_event(admin["id"],admin["email"],"ADMIN_LOGOUT"); st.session_state.clear(); st.rerun()
+    if page=="Overview":
+        with db() as c:
+            users=c.execute("SELECT COUNT(*) n FROM users WHERE role='user'").fetchone()["n"]
+            blocked=c.execute("SELECT COUNT(*) n FROM users WHERE is_blocked=1").fetchone()["n"]
+            logs=c.execute("SELECT COUNT(*) n FROM login_events").fetchone()["n"]
+            analyses=c.execute("SELECT COUNT(*) n FROM analyses").fetchone()["n"]
+        st.title("Admin overview")
+        cols=st.columns(4)
+        for col,label,val in zip(cols,["Users","Blocked accounts","Login events","Analyses"],[users,blocked,logs,analyses]): col.metric(label,val)
+        st.info("Administrators can view account/contact and audit metadata. Passwords are never displayed; only salted password hashes are stored.")
+    elif page=="Users":
+        st.title("User management")
+        with db() as c: rows=c.execute("SELECT id,name,email,phone,role,verified,is_blocked,two_fa,created_at,last_login FROM users ORDER BY id DESC").fetchall()
+        st.dataframe(pd.DataFrame([dict(r) for r in rows]),use_container_width=True,hide_index=True)
+        uid=st.number_input("User ID",min_value=1,step=1)
+        action=st.selectbox("Action",["Block user","Unblock user","Delete user"])
+        if st.button("Apply user action"):
+            with db() as c:
+                if action=="Block user": c.execute("UPDATE users SET is_blocked=1 WHERE id=? AND role!='admin'",(uid,))
+                elif action=="Unblock user": c.execute("UPDATE users SET is_blocked=0 WHERE id=? AND role!='admin'",(uid,))
+                else: c.execute("DELETE FROM users WHERE id=? AND role!='admin'",(uid,))
+            st.success("Action applied (administrator accounts are protected)."); st.rerun()
+    elif page=="Login activity":
+        st.title("Login and security activity")
+        with db() as c: rows=c.execute("SELECT id,user_id,email,event,ip,user_agent,created_at FROM login_events ORDER BY id DESC LIMIT 1000").fetchall()
+        st.dataframe(pd.DataFrame([dict(r) for r in rows]),use_container_width=True,hide_index=True)
+        if rows: st.download_button("Download audit CSV",pd.DataFrame([dict(r) for r in rows]).to_csv(index=False),"voiceguard_login_activity.csv","text/csv")
+    elif page=="Analysis records":
+        st.title("Platform analysis records")
+        with db() as c: rows=c.execute("SELECT id,user_id,filename,prediction,real_score,fake_score,created_at FROM analyses ORDER BY created_at DESC LIMIT 1000").fetchall()
+        st.dataframe(pd.DataFrame([dict(r) for r in rows]),use_container_width=True,hide_index=True)
 
-# Immediate playback preview: users can listen before running AI analysis.
-selected_count = len(uploads or []) + (1 if recording is not None else 0)
-if selected_count:
-    st.markdown("<div class='audio-preview'><div class='section-kicker'>Audio preview · Listen before analysis</div></div>", unsafe_allow_html=True)
-    preview_tabs = st.tabs([f"🎧 {getattr(f, 'name', f'Audio {i+1}')[:28]}" for i, f in enumerate(list(uploads or []) + ([recording] if recording is not None else []))])
-    preview_items = list(uploads or []) + ([recording] if recording is not None else [])
-    for tab, audio_item in zip(preview_tabs, preview_items):
-        with tab:
-            item_name = getattr(audio_item, "name", "recording.wav")
-            audio_mime = mimetypes.guess_type(item_name)[0] or "audio/wav"
-            st.audio(audio_item.getvalue(), format=audio_mime)
-            st.caption("Playback preview — this is the recording that will be sent for analysis.")
+init_db()
+user=current_user()
+if not user:
+    auth_ui()
+elif user["is_blocked"]:
+    st.error("This account is blocked."); st.session_state.clear()
+elif user["role"]=="admin":
+    admin_app(user)
+else:
+    user_app(user)
 
-if st.button("🚀 Analyze selected audio", type="primary", use_container_width=True, disabled=not (uploads or recording)):
-    items = list(uploads or [])
-    if recording is not None:
-        items.append(recording)
-    progress = st.progress(0, text="Preparing audio...")
-    for idx, item in enumerate(items):
-        raw = item.getvalue()
-        filename = getattr(item, "name", None) or f"recording_{idx+1}.wav"
-        digest = hashlib.sha256(raw).hexdigest()
-        key = digest[:12]
-        try:
-            progress.progress((idx) / len(items), text=f"Analyzing {filename}...")
-            audio, sr = decode_audio(raw)
-            scores, prediction, real_score, fake_score = classify_audio(audio, sr)
-            result = {"filename": filename, "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                      "prediction": prediction, "real_score": real_score, "fake_score": fake_score,
-                      "scores": scores, "metrics": audio_metrics(audio, sr), "audio": audio,
-                      "sr": sr, "raw_bytes": raw, "sha256": digest}
-            st.session_state.results[key] = result
-            if not any(x.get("sha256") == digest for x in st.session_state.history):
-                st.session_state.history.append({"filename": filename, "timestamp": result["timestamp"],
-                    "prediction": prediction, "real_score": real_score, "fake_score": fake_score, "sha256": digest})
-        except Exception as exc:
-            st.error(f"Could not analyze {filename}: {exc}")
-    progress.progress(1.0, text="Analysis complete")
-    st.success(f"Finished processing {len(items)} recording(s).")
-
-# ---------- Results and history ----------
-if st.session_state.results:
-    st.markdown("---")
-    st.markdown("## Analysis results")
-    for key, result in list(st.session_state.results.items())[::-1]:
-        with st.container(border=True):
-            render_result(result, key)
-
-if st.session_state.history:
-    st.markdown("---")
-    st.markdown("## Recent session history")
-    hist = pd.DataFrame(st.session_state.history[::-1])
-    st.dataframe(hist.drop(columns=["sha256"], errors="ignore"), use_container_width=True, hide_index=True)
-    st.download_button("⬇️ Export history CSV", hist.to_csv(index=False), "voiceguard_session_history.csv", "text/csv")
-
-with st.expander("🔐 Privacy, interpretation & model limitations"):
-    st.markdown("""
-    - The displayed scores are raw softmax outputs, **not calibrated probabilities**.
-    - Results are not proof of authenticity, identity, or fraud. False positives and false negatives are possible.
-    - Performance may vary by language, speaker, microphone, codec, recording quality, and synthesis method.
-    - Account name, username, Gmail, mobile number, password hash and optional profile picture are stored in the local SQLite user database. Passwords are PBKDF2-hashed; raw passwords are not stored.
-    - This prototype does not verify email addresses or mobile numbers. SQLite on a local disk is suitable for a local demo, not a multi-instance public production service. Use a managed persistent database, verified email flow, HTTPS, backups and privacy policy before public launch.
-    - Session history is stored in Streamlit session state and is not written to a database by this app. Hosting providers, browsers, operating systems, and networks may have their own retention behavior.
-    - Whisper transcripts can contain recognition errors and are not evidence of authenticity.
-    - Only analyze recordings you have permission to use. Review the model card and license before public or commercial deployment.
-    """)
-    st.caption(f"Detector model: {DETECTOR_ID} · Transcript model: {ASR_ID}")
-
-st.markdown("<hr><p style='text-align:center;color:#8193ad;font-size:.8rem'>VoiceGuard AI · Account-enabled academic project prototype · Use results as screening signals only</p>", unsafe_allow_html=True)
+st.markdown("---")
+st.caption("VoiceGuard AI · Academic prototype. Analyze only recordings you have permission to use. Detection results can be wrong.")
