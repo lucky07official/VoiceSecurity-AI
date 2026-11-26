@@ -113,7 +113,27 @@ def issue_otp(email, purpose):
         c.execute("DELETE FROM otp_codes WHERE email=? AND purpose=?", (email,purpose))
         c.execute("INSERT INTO otp_codes(email,purpose,code_hash,expires_at,created_at) VALUES(?,?,?,?,?)",
                   (email,purpose,digest,time.time()+600,time.time()))
-    ok,msg=send_email(email, f"Your VoiceGuard {purpose} code", f"Your verification code is {code}. It expires in 10 minutes. Do not share it.")
+    support_email = os.getenv("SUPPORT_EMAIL", os.getenv("SMTP_USERNAME", ""))
+    email_body = f"""Hello,
+
+Your VoiceGuard AI {purpose.replace("_", " ").title()} OTP is: {code}
+This code is valid for 10 minutes only. Please do not share it with anyone.
+
+Important notes:
+1. Enter this OTP only on the official VoiceGuard AI website.
+2. VoiceGuard support will never ask you to share your OTP or password.
+3. If the code expires, request a fresh OTP from the website.
+4. If you did not request this code, ignore this email and secure your account.
+5. Check your Inbox, Spam and Promotions folders if you cannot find future emails.
+6. Never forward this message or share its verification code with anyone.
+7. For login, signup or password-reset issues, contact our support team.
+8. Email support: {support_email or "Please configure SUPPORT_EMAIL in Streamlit Secrets"}.
+
+Regards,
+VoiceGuard AI Support Team
+"""
+    purpose_label = purpose.replace("_", " ").title()
+    ok,msg=send_email(email, f"Your VoiceGuard AI {purpose_label} OTP", email_body)
     if not ok:
         # Do not leave an unusable OTP behind when SMTP delivery fails.
         with db() as c:
@@ -314,7 +334,7 @@ def auth_ui():
                 if ok: st.success("A new signup OTP has been sent.")
                 else: st.error(msg)
     with tabs[2]:
-        email=st.text_input("Account email",key="reset_email").strip().lower()
+        email=st.text_input("Account email",key="reset_email_input").strip().lower()
         if st.button("Send password reset OTP"):
             with db() as c:
                 user=c.execute("SELECT id,verified,is_blocked FROM users WHERE email=?",(email,)).fetchone()
@@ -329,12 +349,12 @@ def auth_ui():
             else:
                 ok,msg=issue_otp(email,"reset")
                 if ok:
-                    st.session_state.reset_email=email
+                    st.session_state.reset_email_target=email
                     st.success("Password reset OTP sent. Check Inbox, Spam and Promotions.")
                 else:
                     st.error(f"Could not send reset OTP: {msg}")
-        if st.session_state.get("reset_email"):
-            st.caption(f"Password reset requested for {st.session_state.reset_email}. OTP expires in 10 minutes.")
+        if st.session_state.get("reset_email_target"):
+            st.caption(f"Password reset requested for {st.session_state.reset_email_target}. OTP expires in 10 minutes.")
             code=st.text_input("Enter 6-digit reset OTP",key="reset_code")
             newpw=st.text_input("New password (10+ characters, letters and numbers)",type="password",key="new_pw")
             reset_col,resend_reset_col=st.columns(2)
@@ -345,16 +365,16 @@ def auth_ui():
             if reset_clicked:
                 if len(newpw)<10 or not any(x.isdigit() for x in newpw) or not any(x.isalpha() for x in newpw):
                     st.error("Use at least 10 characters with both letters and numbers.")
-                elif verify_otp(st.session_state.reset_email,"reset",code):
+                elif verify_otp(st.session_state.reset_email_target,"reset",code):
                     with db() as c:
                         c.execute("UPDATE users SET password_hash=? WHERE email=?",
-                                  (hash_password(newpw),st.session_state.reset_email))
+                                  (hash_password(newpw),st.session_state.reset_email_target))
                     del st.session_state.reset_email
                     st.success("Password updated successfully. Please log in with your new password.")
                 else:
                     st.error("Reset OTP is invalid, expired, or has reached the 5-attempt limit. Request a new OTP.")
             if resend_reset:
-                ok,msg=issue_otp(st.session_state.reset_email,"reset")
+                ok,msg=issue_otp(st.session_state.reset_email_target,"reset")
                 if ok: st.success("A new password reset OTP has been sent.")
                 else: st.error(msg)
 
@@ -422,7 +442,6 @@ def user_app(user):
                     c1.download_button("⬇️ Download PDF",make_pdf(result),file_name=f"VoiceGuard_{rid[:8]}.pdf",mime="application/pdf",key=f"pdf{rid}")
                     c2.download_button("⬇️ Download JSON",json.dumps(result,indent=2),file_name=f"VoiceGuard_{rid[:8]}.json",mime="application/json",key=f"json{rid}")
                     c3.download_button("⬇️ Download CSV",pd.DataFrame([{"analysis_id":rid,"filename":filename,"timestamp":created,"prediction":pred,"real_score":real,"fake_score":fake,**met}]).to_csv(index=False),file_name=f"VoiceGuard_{rid[:8]}.csv",mime="text/csv",key=f"csv{rid}")
-                    st.warning("Model scores are raw outputs, not calibrated probabilities. This is a screening signal, not proof of authenticity, identity or fraud. False positives and false negatives are possible.")
                 except Exception as e: st.error(f"Could not analyze {filename}: {e}")
         with st.expander("🔐 Privacy, interpretation & model limitations"):
             st.write("Uploaded audio is processed for analysis and is not stored by this app. Analysis metadata, scores and acoustic metrics are saved to your account history. Only upload recordings you have permission to use. The detector can make mistakes.")
@@ -498,7 +517,7 @@ def admin_app(admin):
 
 init_db()
 if len(os.getenv("OTP_SECRET", "")) < 32 or os.getenv("OTP_SECRET", "").startswith("change-this"):
-    st.warning("Security setup required: set a unique OTP_SECRET (32+ characters) in your deployment secrets before using email OTP in production.")
+    st.caption("Security setup: configure a unique OTP_SECRET (32+ characters) in Streamlit Secrets before production use.")
 user=current_user()
 if not user:
     auth_ui()
