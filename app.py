@@ -369,7 +369,7 @@ def auth_ui():
                     with db() as c:
                         c.execute("UPDATE users SET password_hash=? WHERE email=?",
                                   (hash_password(newpw),st.session_state.reset_email_target))
-                    del st.session_state.reset_email
+                    del st.session_state.reset_email_target
                     st.success("Password updated successfully. Please log in with your new password.")
                 else:
                     st.error("Reset OTP is invalid, expired, or has reached the 5-attempt limit. Request a new OTP.")
