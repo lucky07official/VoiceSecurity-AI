@@ -114,6 +114,10 @@ def issue_otp(email, purpose):
         c.execute("INSERT INTO otp_codes(email,purpose,code_hash,expires_at,created_at) VALUES(?,?,?,?,?)",
                   (email,purpose,digest,time.time()+600,time.time()))
     ok,msg=send_email(email, f"Your VoiceGuard {purpose} code", f"Your verification code is {code}. It expires in 10 minutes. Do not share it.")
+    if not ok:
+        # Do not leave an unusable OTP behind when SMTP delivery fails.
+        with db() as c:
+            c.execute("DELETE FROM otp_codes WHERE email=? AND purpose=?", (email,purpose))
     return ok,msg
 
 def verify_otp(email,purpose,code):
@@ -220,8 +224,14 @@ def auth_ui():
                 else: st.error(msg)
         if st.session_state.get("login_otp_email"):
             st.markdown("**Two-step verification**")
+            st.caption(f"Login OTP sent to {st.session_state.login_otp_email}. Check Inbox, Spam and Promotions.")
             otp=st.text_input("6-digit email code",key="login_otp")
-            if st.button("Verify and login"):
+            login_col,resend_login_col=st.columns(2)
+            with login_col:
+                verify_login=st.button("Verify and login",use_container_width=True)
+            with resend_login_col:
+                resend_login=st.button("Resend login OTP",use_container_width=True)
+            if verify_login:
                 email=st.session_state.login_otp_email
                 if verify_otp(email,"login",otp):
                     with db() as c: user=c.execute("SELECT * FROM users WHERE email=?",(email,)).fetchone()
@@ -231,8 +241,14 @@ def auth_ui():
                         st.session_state.user_id=user["id"]
                         with db() as c: c.execute("UPDATE users SET last_login=? WHERE id=?",(now(),user["id"]))
                         log_event(user["id"],email,"LOGIN_SUCCESS_OTP")
-                        del st.session_state.login_otp_email; st.rerun()
-                else: st.error("Invalid or expired code.")
+                        del st.session_state.login_otp_email
+                        st.rerun()
+                else:
+                    st.error("OTP is invalid, expired, or has reached the 5-attempt limit. Request a new OTP.")
+            if resend_login:
+                ok,msg=issue_otp(st.session_state.login_otp_email,"login")
+                if ok: st.success("A new login OTP has been sent.")
+                else: st.error(msg)
     with tabs[1]:
         with st.form("signup_form"):
             name=st.text_input("Full name"); email=st.text_input("Email address").strip().lower()
@@ -244,44 +260,103 @@ def auth_ui():
             elif len(pw)<10 or not any(x.isdigit() for x in pw) or not any(x.isalpha() for x in pw): st.error("Use at least 10 characters with letters and numbers.")
             elif pw!=confirm: st.error("Passwords do not match.")
             else:
-                with db() as c: exists=c.execute("SELECT 1 FROM users WHERE email=?",(email,)).fetchone()
-                if exists: st.error("An account with this email already exists.")
+                with db() as c:
+                    existing=c.execute("SELECT id,verified,is_blocked FROM users WHERE email=?",(email,)).fetchone()
+
+                if existing and existing["verified"]:
+                    st.error("This email is already registered. Please log in or use Forgot password.")
+                elif existing and existing["is_blocked"]:
+                    st.error("This account is blocked. Please contact the administrator.")
+                elif not all(os.getenv(k) for k in ["SMTP_HOST","SMTP_USERNAME","SMTP_PASSWORD"]):
+                    st.error("Email OTP is not configured. Add SMTP settings in Streamlit Secrets.")
                 else:
-                    if not all(os.getenv(k) for k in ["SMTP_HOST","SMTP_USERNAME","SMTP_PASSWORD"]): st.error("Email OTP is not configured. Set SMTP settings in .env first.")
-                    else:
+                    if not existing:
+                        # Create an unverified account. If the user closes the page,
+                        # the next signup attempt can resume verification for this email.
                         with db() as c:
-                            c.execute("INSERT INTO users(name,email,phone,password_hash,created_at) VALUES(?,?,?,?,?)",
-                                      (name.strip(),email,phone.strip(),hash_password(pw),now()))
-                        ok,msg=issue_otp(email,"signup")
-                        if ok: st.session_state.signup_otp_email=email; st.success("Account created. Check your email for OTP.")
-                        else: st.error(msg)
+                            c.execute(
+                                "INSERT INTO users(name,email,phone,password_hash,created_at) VALUES(?,?,?,?,?)",
+                                (name.strip(),email,phone.strip(),hash_password(pw),now())
+                            )
+                    else:
+                        # Resume an abandoned, unverified registration.
+                        with db() as c:
+                            c.execute(
+                                "UPDATE users SET name=?,phone=?,password_hash=? WHERE email=? AND verified=0",
+                                (name.strip(),phone.strip(),hash_password(pw),email)
+                            )
+
+                    ok,msg=issue_otp(email,"signup")
+                    if ok:
+                        st.session_state.signup_otp_email=email
+                        st.success("Verification code sent. Enter the OTP below to finish creating your account.")
+                    else:
+                        st.error(f"Could not send signup OTP: {msg}")
         if st.session_state.get("signup_otp_email"):
-            code=st.text_input("Enter email verification OTP",key="signup_otp")
-            if st.button("Verify email"):
+            st.caption(f"Verification is pending for {st.session_state.signup_otp_email}. Check Inbox, Spam and Promotions.")
+            code=st.text_input("Enter 6-digit email verification OTP",key="signup_otp")
+            verify_col,resend_col=st.columns(2)
+            with verify_col:
+                verify_signup=st.button("Verify email",use_container_width=True)
+            with resend_col:
+                resend_signup=st.button("Resend signup OTP",use_container_width=True)
+            if verify_signup:
                 email=st.session_state.signup_otp_email
                 if verify_otp(email,"signup",code):
                     with db() as c: c.execute("UPDATE users SET verified=1 WHERE email=?",(email,))
-                    log_event(None,email,"SIGNUP_VERIFIED"); del st.session_state.signup_otp_email
-                    st.success("Email verified. You can now log in.")
-                else: st.error("Invalid or expired OTP.")
+                    log_event(None,email,"SIGNUP_VERIFIED")
+                    del st.session_state.signup_otp_email
+                    st.success("Email verified. Your account is ready. Please log in.")
+                else:
+                    st.error("OTP is invalid, expired, or has reached the 5-attempt limit. Request a new OTP.")
+            if resend_signup:
+                ok,msg=issue_otp(st.session_state.signup_otp_email,"signup")
+                if ok: st.success("A new signup OTP has been sent.")
+                else: st.error(msg)
     with tabs[2]:
         email=st.text_input("Account email",key="reset_email").strip().lower()
         if st.button("Send password reset OTP"):
-            with db() as c: user=c.execute("SELECT id FROM users WHERE email=?",(email,)).fetchone()
-            if user:
+            with db() as c:
+                user=c.execute("SELECT id,verified,is_blocked FROM users WHERE email=?",(email,)).fetchone()
+            if not email or "@" not in email:
+                st.error("Please enter a valid account email.")
+            elif not user:
+                st.info("If the account exists, a reset email can be sent.")
+            elif not user["verified"]:
+                st.error("This account's email is not verified. Finish signup verification first.")
+            elif user["is_blocked"]:
+                st.error("This account is blocked. Please contact the administrator.")
+            else:
                 ok,msg=issue_otp(email,"reset")
-                if ok: st.session_state.reset_email=email; st.success("Reset code sent.")
-                else: st.error(msg)
-            else: st.info("If the account exists, a reset email can be sent.")
+                if ok:
+                    st.session_state.reset_email=email
+                    st.success("Password reset OTP sent. Check Inbox, Spam and Promotions.")
+                else:
+                    st.error(f"Could not send reset OTP: {msg}")
         if st.session_state.get("reset_email"):
-            code=st.text_input("Reset OTP",key="reset_code")
-            newpw=st.text_input("New password (10+ characters)",type="password",key="new_pw")
-            if st.button("Reset password"):
-                if len(newpw)<10: st.error("Password must be at least 10 characters.")
+            st.caption(f"Password reset requested for {st.session_state.reset_email}. OTP expires in 10 minutes.")
+            code=st.text_input("Enter 6-digit reset OTP",key="reset_code")
+            newpw=st.text_input("New password (10+ characters, letters and numbers)",type="password",key="new_pw")
+            reset_col,resend_reset_col=st.columns(2)
+            with reset_col:
+                reset_clicked=st.button("Reset password",use_container_width=True)
+            with resend_reset_col:
+                resend_reset=st.button("Resend reset OTP",use_container_width=True)
+            if reset_clicked:
+                if len(newpw)<10 or not any(x.isdigit() for x in newpw) or not any(x.isalpha() for x in newpw):
+                    st.error("Use at least 10 characters with both letters and numbers.")
                 elif verify_otp(st.session_state.reset_email,"reset",code):
-                    with db() as c: c.execute("UPDATE users SET password_hash=? WHERE email=?",(hash_password(newpw),st.session_state.reset_email))
-                    del st.session_state.reset_email; st.success("Password updated. Please log in.")
-                else: st.error("Invalid or expired OTP.")
+                    with db() as c:
+                        c.execute("UPDATE users SET password_hash=? WHERE email=?",
+                                  (hash_password(newpw),st.session_state.reset_email))
+                    del st.session_state.reset_email
+                    st.success("Password updated successfully. Please log in with your new password.")
+                else:
+                    st.error("Reset OTP is invalid, expired, or has reached the 5-attempt limit. Request a new OTP.")
+            if resend_reset:
+                ok,msg=issue_otp(st.session_state.reset_email,"reset")
+                if ok: st.success("A new password reset OTP has been sent.")
+                else: st.error(msg)
 
 def user_app(user):
     with st.sidebar:
