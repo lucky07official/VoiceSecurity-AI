@@ -103,37 +103,6 @@ def send_email(to, subject, body):
     except Exception as e:
         return False, f"Email delivery failed: {e}"
 
-def send_account_notice(email, name, action):
-    """Notify a user about an administrator action before account deletion."""
-    if action == "blocked":
-        subject = "Your VoiceGuard AI account has been blocked"
-        body = f"""Hello {name or "User"},
-
-Your VoiceGuard AI account has been blocked by an administrator.
-You will no longer be able to sign in or use the platform.
-
-If you believe this action was taken by mistake, please contact the VoiceGuard AI support team.
-
-Regards,
-VoiceGuard AI Support Team
-"""
-    elif action == "deleted":
-        subject = "Your VoiceGuard AI account has been deleted"
-        body = f"""Hello {name or "User"},
-
-This is to inform you that your VoiceGuard AI account has been deleted by an administrator.
-You will no longer be able to sign in or access this account.
-
-If you believe this action was taken by mistake or have questions, please contact the VoiceGuard AI support team.
-
-Regards,
-VoiceGuard AI Support Team
-"""
-    else:
-        return False, "Unsupported account notification."
-    return send_email(email, subject, body)
-
-
 def issue_otp(email, purpose):
     with db() as c:
         recent=c.execute("SELECT created_at FROM otp_codes WHERE email=? AND purpose=? ORDER BY id DESC LIMIT 1",(email,purpose)).fetchone()
@@ -527,47 +496,10 @@ def admin_app(admin):
         action=st.selectbox("Action",["Block user","Unblock user","Delete user"])
         if st.button("Apply user action"):
             with db() as c:
-                target = c.execute(
-                    "SELECT id,name,email,role,is_blocked FROM users WHERE id=?",
-                    (uid,)
-                ).fetchone()
-
-                if not target:
-                    st.error("User ID not found.")
-                elif target["role"] == "admin":
-                    st.error("Administrator accounts are protected.")
-                elif action == "Block user":
-                    if target["is_blocked"]:
-                        st.info("This account is already blocked.")
-                    else:
-                        # Send the notification before changing the account status.
-                        mail_ok, mail_msg = send_account_notice(
-                            target["email"], target["name"], "blocked"
-                        )
-                        c.execute("UPDATE users SET is_blocked=1 WHERE id=? AND role!='admin'", (uid,))
-                        log_event(target["id"], target["email"], "ACCOUNT_BLOCKED_BY_ADMIN")
-                        st.success("User account blocked.")
-                        if mail_ok:
-                            st.success(f"Block notification sent to {target['email']}.")
-                        else:
-                            st.warning(f"Account was blocked, but email could not be sent: {mail_msg}")
-                elif action == "Unblock user":
-                    c.execute("UPDATE users SET is_blocked=0 WHERE id=? AND role!='admin'", (uid,))
-                    log_event(target["id"], target["email"], "ACCOUNT_UNBLOCKED_BY_ADMIN")
-                    st.success("User account unblocked.")
-                else:
-                    # Fetch and email the user before deleting their account row.
-                    mail_ok, mail_msg = send_account_notice(
-                        target["email"], target["name"], "deleted"
-                    )
-                    log_event(target["id"], target["email"], "ACCOUNT_DELETED_BY_ADMIN")
-                    c.execute("DELETE FROM users WHERE id=? AND role!='admin'", (uid,))
-                    st.success("User account deleted.")
-                    if mail_ok:
-                        st.success(f"Deletion notification sent to {target['email']}.")
-                    else:
-                        st.warning(f"Account was deleted, but email could not be sent: {mail_msg}")
-            st.rerun()
+                if action=="Block user": c.execute("UPDATE users SET is_blocked=1 WHERE id=? AND role!='admin'",(uid,))
+                elif action=="Unblock user": c.execute("UPDATE users SET is_blocked=0 WHERE id=? AND role!='admin'",(uid,))
+                else: c.execute("DELETE FROM users WHERE id=? AND role!='admin'",(uid,))
+            st.success("Action applied (administrator accounts are protected)."); st.rerun()
     elif page=="Login activity":
         st.title("Login and security activity")
         with db() as c: rows=c.execute("SELECT id,user_id,email,event,ip,user_agent,created_at FROM login_events ORDER BY id DESC LIMIT 1000").fetchall()
